@@ -1,0 +1,12 @@
+[submodule "src/px4_msgs"]
+	path = src/px4_msgs
+	url = https://github.com/PX4/px4_msgs.git
+[submodule "src/mocap4r2"]
+	path = src/mocap4r2
+	url = https://github.com/MOCAP4ROS2-Project/mocap4r2.git
+[submodule "src/mocap4r2_msgs"]
+	path = src/mocap4r2_msgs
+	url = https://github.com/MOCAP4ROS2-Project/mocap4r2_msgs.git
+[submodule "mapper"]
+	path = mapper
+	url = https://github.com/lukasiktar/04_Vertical_mapper.git

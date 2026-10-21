@@ -1,0 +1,373 @@
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joy.hpp"
+#include "px4_msgs/msg/vehicle_command.hpp"
+#include "px4_msgs/msg/vehicle_command_ack.hpp"
+#include "px4_msgs/msg/manual_control_setpoint.hpp"
+#include <px4_msgs/srv/vehicle_command.hpp>
+
+#include <chrono>
+#include <cmath>
+
+// Same as px4_control_node_manual.cpp, minus OFFBOARD mode: no D-pad velocity
+// control, no offboard_control_mode/trajectory_setpoint stream, no R2 switch.
+// Offboard is now owned exclusively by aruco_approach_prompt, which streams its
+// own setpoints on those same topics -- running both nodes' offboard streams
+// at once meant PX4 saw two uncoordinated setpoint sources racing each other.
+class PX4ManualControl : public rclcpp::Node
+{
+public:
+    PX4ManualControl() : Node("px4_manual_control_v2")
+    {
+        vehicle_command_client_ = this->create_client<px4_msgs::srv::VehicleCommand>("/fmu/vehicle_command");
+
+        rclcpp::QoS qos_pub(1);
+        qos_pub.best_effort().durability_volatile();
+        manual_control_publisher_ = this->create_publisher<px4_msgs::msg::ManualControlSetpoint>(
+            "/fmu/in/manual_control_input", qos_pub);
+
+        joy_subscriber_ = this->create_subscription<sensor_msgs::msg::Joy>(
+            "/joy", 10,
+            [this](const sensor_msgs::msg::Joy::SharedPtr msg)
+            {
+                joy_callback(msg);
+            });
+
+        // Publish continuously (not just on stick movement) so PX4 never sees
+        // the manual control source go stale/timeout (COM_RC_LOSS_T) while sticks
+        // are held steady.
+        manual_control_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(20),
+            [this]()
+            {
+                publish_manual_control();
+            });
+
+        RCLCPP_INFO(this->get_logger(), "PX4 Manual Control node (no OFFBOARD) started!");
+        RCLCPP_INFO(this->get_logger(), "Square=HOLD mode  Cross=ARM  Circle=POSITION mode  Triangle=STABILIZED mode  L1=LAND  R1=TAKEOFF  L2=ALTITUDE mode  Options=DISARM (kill)");
+        RCLCPP_INFO(this->get_logger(), "Left stick=Throttle/Yaw  Right stick=Pitch/Roll (Mode 2)");
+        RCLCPP_INFO(this->get_logger(),
+            "Sticks only move the vehicle once it's armed AND in a manual flight mode (Circle). "
+            "If it doesn't respond, check COM_RC_IN_MODE allows MAVLink/joystick input.");
+    }
+
+private:
+    // Vehicle command IDs
+    static constexpr uint16_t VEHICLE_CMD_ARM = 400;
+    static constexpr uint16_t VEHICLE_CMD_TAKEOFF = 22;
+    static constexpr uint16_t VEHICLE_CMD_LAND = 21;
+    static constexpr uint16_t VEHICLE_CMD_DO_SET_MODE = 176;
+
+    static constexpr float TARGET_ALTITUDE = 1.0f;
+
+    // MAV_CMD_COMPONENT_ARM_DISARM force-disarm magic number: bypasses the
+    // landed-state check so the kill button also works mid-flight.
+    static constexpr float FORCE_DISARM_MAGIC = 21196.0f;
+
+    // MAV_CMD_DO_SET_MODE params: base_mode flag + PX4 custom main/sub mode (px4_custom_mode.h)
+    static constexpr float MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1.0f;
+    static constexpr float PX4_CUSTOM_MAIN_MODE_STABILIZED = 7.0f;
+    static constexpr float PX4_CUSTOM_MAIN_MODE_ALTCTL = 2.0f;
+    static constexpr float PX4_CUSTOM_MAIN_MODE_POSCTL = 3.0f;
+    static constexpr float PX4_CUSTOM_MAIN_MODE_AUTO = 4.0f;
+    static constexpr float PX4_CUSTOM_SUB_MODE_AUTO_HOLD = 3.0f;
+
+    // PS4 controller button indices (Wireless Controller via joy_node), confirmed live
+    static constexpr size_t BTN_HOLD = 0;       // Square
+    static constexpr size_t BTN_ARM = 1;        // Cross
+    static constexpr size_t BTN_POSCTL = 2;     // Circle
+    static constexpr size_t BTN_STABILIZED = 3; // Triangle
+    static constexpr size_t BTN_LAND = 4;       // L1
+    static constexpr size_t BTN_TAKEOFF = 5;    // R1
+    static constexpr size_t BTN_DISARM = 9;     // Options (kill switch)
+
+    // PS4 controller axis indices, confirmed live (see joystick probe)
+    static constexpr size_t AXIS_LEFT_X = 0;
+    static constexpr size_t AXIS_LEFT_Y = 1;
+    static constexpr size_t AXIS_L2 = 3;      // analog trigger, rests at +1.0, pulled = negative
+    static constexpr size_t AXIS_RIGHT_X = 2;
+    static constexpr size_t AXIS_RIGHT_Y = 5;
+    static constexpr size_t MIN_AXES_REQUIRED = 5;
+
+    // L2 is an analog trigger, not a digital button, so treat "pulled past halfway"
+    // as pressed and edge-detect that the same way as the digital buttons.
+    static constexpr float TRIGGER_PRESSED_THRESHOLD = 0.8f;
+
+    bool is_rising_edge(const sensor_msgs::msg::Joy::SharedPtr &msg, size_t idx) const
+    {
+        if (idx >= msg->buttons.size() || idx >= prev_buttons_.size())
+        {
+            return false;
+        }
+        return prev_buttons_[idx] == 0 && msg->buttons[idx] == 1;
+    }
+
+    void joy_callback(const sensor_msgs::msg::Joy::SharedPtr msg)
+    {
+        if (msg->axes.size() >= MIN_AXES_REQUIRED)
+        {
+            const bool l2_pressed_now = msg->axes[AXIS_L2] < TRIGGER_PRESSED_THRESHOLD;
+
+            if (has_joy_data_ && l2_pressed_now && !l2_was_pressed_)
+            {
+                switch_to_altitude_mode();
+            }
+
+            l2_was_pressed_ = l2_pressed_now;
+            latest_axes_ = msg->axes;
+            has_joy_data_ = true;
+        }
+
+        if (prev_buttons_.size() != msg->buttons.size())
+        {
+            // First message (or controller reconnect): establish baseline, don't fire.
+            prev_buttons_ = msg->buttons;
+            return;
+        }
+
+        // Kill switch is checked first so it always wins if pressed together with another button.
+        if (is_rising_edge(msg, BTN_DISARM))
+        {
+            disarm();
+        }
+        else if (is_rising_edge(msg, BTN_HOLD))
+        {
+            HOLD();
+        }
+        else if (is_rising_edge(msg, BTN_ARM))
+        {
+            arm();
+        }
+        else if (is_rising_edge(msg, BTN_POSCTL))
+        {
+            switch_to_position_mode();
+        }
+        else if (is_rising_edge(msg, BTN_STABILIZED))
+        {
+            switch_to_stabilized_mode();
+        }
+        else if (is_rising_edge(msg, BTN_LAND))
+        {
+            land();
+        }
+        else if (is_rising_edge(msg, BTN_TAKEOFF))
+        {
+            takeoff(TARGET_ALTITUDE);
+        }
+
+        prev_buttons_ = msg->buttons;
+    }
+
+    // Builds and publishes manual_control_input from the latest stick state at a
+    // fixed rate. Mode 2 RC layout: left stick = throttle/yaw, right stick = pitch/roll.
+    // Axis signs below correct for this controller's raw convention (left/up positive)
+    // to match PX4's roll+/pitch-/yaw+/throttle+ meanings.
+    void publish_manual_control()
+    {
+        if (!has_joy_data_)
+        {
+            return;
+        }
+
+        px4_msgs::msg::ManualControlSetpoint msg{};
+
+        const uint64_t now_us = this->get_clock()->now().nanoseconds() / 1000;
+        msg.timestamp = now_us;
+        msg.timestamp_sample = now_us;
+        msg.valid = true;
+        msg.data_source = px4_msgs::msg::ManualControlSetpoint::SOURCE_MAVLINK_0;
+
+        msg.throttle = latest_axes_[AXIS_LEFT_Y];
+        msg.yaw = -latest_axes_[AXIS_LEFT_X];
+        msg.pitch = latest_axes_[AXIS_RIGHT_Y];
+        msg.roll = -latest_axes_[AXIS_RIGHT_X];
+
+        msg.flaps = NAN;
+        msg.aux1 = NAN;
+        msg.aux2 = NAN;
+        msg.aux3 = NAN;
+        msg.aux4 = NAN;
+        msg.aux5 = NAN;
+        msg.aux6 = NAN;
+
+        msg.sticks_moving = false;
+        msg.buttons = 0;
+
+        manual_control_publisher_->publish(msg);
+    }
+
+    void arm()
+    {
+        RCLCPP_INFO(this->get_logger(), "[Cross] ARM requested (keeping current mode)");
+        // Arms in whatever mode PX4 is already in. Manual/Stabilized require the
+        // throttle stick at the bottom (< -0.8) to arm, which a self-centering gamepad
+        // stick can't do, so PX4 will reject it there -- pick Position (Circle) or
+        // Altitude (L2) first, both accept a centered throttle.
+        auto arm_command = create_vehicle_command(VEHICLE_CMD_ARM, 1.0f);
+        send_vehicle_command(arm_command);
+    }
+
+    void disarm()
+    {
+        RCLCPP_WARN(this->get_logger(), "[Options] DISARM (kill) requested");
+        auto command = create_vehicle_command(VEHICLE_CMD_ARM, 0.0f, FORCE_DISARM_MAGIC);
+        send_vehicle_command(command);
+    }
+
+    void takeoff(float altitude)
+    {
+        RCLCPP_INFO(this->get_logger(), "[R1] TAKEOFF requested, altitude=%.2f m", altitude);
+        auto command = create_vehicle_command(VEHICLE_CMD_TAKEOFF, NAN, NAN, NAN, NAN, NAN, NAN, altitude);
+        send_vehicle_command(command);
+    }
+
+    void land()
+    {
+        RCLCPP_INFO(this->get_logger(), "[L1] LAND requested");
+        auto command = create_vehicle_command(VEHICLE_CMD_LAND);
+        send_vehicle_command(command);
+    }
+
+    void switch_to_position_mode()
+    {
+        RCLCPP_INFO(this->get_logger(), "[Circle] Switching to POSITION mode (sticks now fly the vehicle)");
+        auto command = create_vehicle_command(
+            VEHICLE_CMD_DO_SET_MODE,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_CUSTOM_MAIN_MODE_POSCTL);
+        send_vehicle_command(command);
+    }
+
+    void switch_to_altitude_mode()
+    {
+        // Altitude holds climb rate like Position mode (centered throttle = hover),
+        // but roll/pitch are self-leveled only, same as Manual -- no GPS position
+        // lock, so it'll still drift horizontally once you release the sticks.
+        RCLCPP_WARN(this->get_logger(), "[L2] Switching to ALTITUDE mode (no position hold, altitude held)");
+        auto command = create_vehicle_command(
+            VEHICLE_CMD_DO_SET_MODE,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_CUSTOM_MAIN_MODE_ALTCTL);
+        send_vehicle_command(command);
+    }
+
+    void switch_to_stabilized_mode()
+    {
+        // Stabilized has no position/altitude hold: throttle is direct thrust (centered
+        // stick != hover) and roll/pitch is self-leveled attitude only, no velocity
+        // or position lock. Expect it to climb/sink and drift once switched.
+        RCLCPP_WARN(this->get_logger(), "[Triangle] Switching to STABILIZED mode (no altitude/position hold!)");
+        auto command = create_vehicle_command(
+            VEHICLE_CMD_DO_SET_MODE,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_CUSTOM_MAIN_MODE_STABILIZED);
+        send_vehicle_command(command);
+    }
+
+    void HOLD()
+    {
+        RCLCPP_INFO(this->get_logger(), "[Square] Switching to HOLD mode (holds position, ignores sticks)");
+        auto command = create_vehicle_command(
+            VEHICLE_CMD_DO_SET_MODE,
+            MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            PX4_CUSTOM_MAIN_MODE_AUTO,
+            PX4_CUSTOM_SUB_MODE_AUTO_HOLD);
+        send_vehicle_command(command);
+    }
+
+    void send_vehicle_command(
+        const px4_msgs::msg::VehicleCommand &command,
+        std::function<void(bool accepted)> on_result = nullptr)
+    {
+        if (!vehicle_command_client_->wait_for_service(std::chrono::seconds(1)))
+        {
+            RCLCPP_ERROR(this->get_logger(), "Vehicle command service is not available!");
+            if (on_result)
+            {
+                on_result(false);
+            }
+            return;
+        }
+
+        auto request = std::make_shared<px4_msgs::srv::VehicleCommand::Request>();
+        request->request = command;
+
+        vehicle_command_client_->async_send_request(
+            request,
+            [this, on_result](rclcpp::Client<px4_msgs::srv::VehicleCommand>::SharedFuture future)
+            {
+                auto response = future.get();
+                const auto &ack = response->reply;
+
+                const bool accepted = (ack.result == px4_msgs::msg::VehicleCommandAck::VEHICLE_CMD_RESULT_ACCEPTED);
+
+                if (accepted)
+                {
+                    RCLCPP_INFO(this->get_logger(), "PX4 ACK: command=%u ACCEPTED", ack.command);
+                }
+                else
+                {
+                    RCLCPP_ERROR(this->get_logger(), "PX4 ACK: command=%u REJECTED (result=%u)", ack.command, ack.result);
+                }
+
+                if (on_result)
+                {
+                    on_result(accepted);
+                }
+            });
+    }
+
+    px4_msgs::msg::VehicleCommand create_vehicle_command(
+        uint16_t command,
+        float param1 = NAN,
+        float param2 = NAN,
+        float param3 = NAN,
+        float param4 = NAN,
+        float param5 = NAN,
+        float param6 = NAN,
+        float param7 = NAN)
+    {
+        px4_msgs::msg::VehicleCommand msg{};
+
+        msg.command = command;
+
+        msg.param1 = param1;
+        msg.param2 = param2;
+        msg.param3 = param3;
+        msg.param4 = param4;
+        msg.param5 = param5;
+        msg.param6 = param6;
+        msg.param7 = param7;
+
+        msg.target_system = 2;
+        msg.target_component = 1;
+
+        msg.source_system = 1;
+        msg.source_component = 1;
+
+        msg.confirmation = 0;
+        msg.from_external = true;
+
+        msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+
+        return msg;
+    }
+
+    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_subscriber_;
+    rclcpp::Client<px4_msgs::srv::VehicleCommand>::SharedPtr vehicle_command_client_;
+    rclcpp::Publisher<px4_msgs::msg::ManualControlSetpoint>::SharedPtr manual_control_publisher_;
+    rclcpp::TimerBase::SharedPtr manual_control_timer_;
+
+    std::vector<int32_t> prev_buttons_;
+    std::vector<float> latest_axes_;
+    bool has_joy_data_ = false;
+    bool l2_was_pressed_ = false;
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<PX4ManualControl>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}

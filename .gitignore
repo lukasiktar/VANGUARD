@@ -1,0 +1,13 @@
+# colcon
+/build/
+/install/
+/log/
+# data (large, machine-local)
+/bags/*
+!/bags/.gitkeep
+# misc
+__pycache__/
+*.pyc
+*.orig
+.vscode/
+/ros2
