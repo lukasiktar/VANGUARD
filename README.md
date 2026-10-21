@@ -168,7 +168,7 @@ Use container:
 
 ```bash
 docker exec -it vanguard_ros2 bash
-docker exec -it vanguard_ros2 bash -ic "colcon build --symlink-install --parallel-workers 2"
+docker exec -it vanguard_ros2 bash -ic "colcon build --symlink-install --parallel-workers 2 --base-paths src"
 docker exec -it vanguard_ros2 bash -ic "ros2 run vanguard vanguard_node"
 ```
 

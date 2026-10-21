@@ -92,7 +92,7 @@ Expected: `vanguard`, `Hi from vanguard.`, `cuda_12.6`, `CUDA devices: 1`.
 | `./ros2-docker.sh up`                    | Start the container                 |
 | `./ros2-docker.sh down`                  | Stop and remove the container       |
 | `./ros2-docker.sh shell`                 | Interactive ROS 2 shell             |
-| `./ros2-docker.sh colcon [args]`         | `colcon build --symlink-install --parallel-workers 2` |
+| `./ros2-docker.sh colcon [args]`         | `colcon build --symlink-install --parallel-workers 2 --base-paths src` |
 | `./ros2-docker.sh run <cmd...>`          | Run a command in the ROS 2 environment |
 
 Edit code on the host in `src/vanguard`.
