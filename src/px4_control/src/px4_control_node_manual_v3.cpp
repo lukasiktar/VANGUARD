@@ -81,7 +81,13 @@ public:
             "/fmu/out/vehicle_status_v1", rclcpp::SensorDataQoS(),
             [this](const px4_msgs::msg::VehicleStatus::SharedPtr msg)
             {
-                offboard_active_ = (msg->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+                const bool active = (msg->nav_state == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
+                if (active != offboard_active_)
+                {
+                    RCLCPP_INFO(this->get_logger(), "%s OFFBOARD (nav_state=%u)",
+                        active ? "Entered" : "Left", msg->nav_state);
+                }
+                offboard_active_ = active;
             });
 
         setpoint_timer_ = this->create_wall_timer(
@@ -143,9 +149,18 @@ private:
     {
         if (msg->axes.size() >= MIN_AXES_REQUIRED)
         {
+            RCLCPP_INFO_ONCE(this->get_logger(), "First /joy message received (%zu axes, %zu buttons)",
+                msg->axes.size(), msg->buttons.size());
+
             latest_axes_ = msg->axes;
             last_joy_recv_time_ = this->get_clock()->now();
             has_joy_data_ = true;
+        }
+        else
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "/joy message has only %zu axes (need >= %zu) -- ignored",
+                msg->axes.size(), MIN_AXES_REQUIRED);
         }
 
         if (prev_buttons_.size() != msg->buttons.size())
@@ -323,16 +338,38 @@ private:
         const bool joy_fresh =
             has_joy_data_ && (now - last_joy_recv_time_).seconds() <= JOY_TIMEOUT_SEC;
 
-        if (has_joy_data_ && !joy_fresh)
+        if (!has_joy_data_)
+        {
+            // Silent before: nothing ever arrived, so there was no "stale" to warn about.
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "no /joy message received yet -- holding position "
+                "(is joy_node running, on the same ROS_DOMAIN_ID, publishing on /joy?)");
+        }
+        else if (!joy_fresh)
         {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "joystick input missing/stale -- holding position");
+                "/joy stale (last message %.2fs ago, timeout %.2fs) -- holding position "
+                "(if this only happens with the stick held still, run joy_node with autorepeat_rate:=20.0)",
+                (now - last_joy_recv_time_).seconds(), JOY_TIMEOUT_SEC);
         }
 
-        const bool stick_idle =
-            !joy_fresh
-            || (std::fabs(latest_axes_[AXIS_LEFT_X]) < STICK_DEADBAND
-                && std::fabs(latest_axes_[AXIS_LEFT_Y]) < STICK_DEADBAND);
+        const bool in_deadband =
+            joy_fresh
+            && std::fabs(latest_axes_[AXIS_LEFT_X]) < STICK_DEADBAND
+            && std::fabs(latest_axes_[AXIS_LEFT_Y]) < STICK_DEADBAND;
+        const bool stick_idle = !joy_fresh || in_deadband;
+
+        // Logged on change only, so a released stick doesn't spam. Shows the raw axis
+        // values the node actually reads, to catch a wrong AXIS_LEFT_X/Y mapping.
+        if (in_deadband != was_in_deadband_)
+        {
+            RCLCPP_INFO(this->get_logger(),
+                "stick %s: axes[%zu]=%.2f axes[%zu]=%.2f (deadband %.2f, %zu axes total)",
+                in_deadband ? "in deadband -> holding position" : "out of deadband -> velocity control",
+                AXIS_LEFT_X, latest_axes_[AXIS_LEFT_X], AXIS_LEFT_Y, latest_axes_[AXIS_LEFT_Y],
+                STICK_DEADBAND, latest_axes_.size());
+            was_in_deadband_ = in_deadband;
+        }
 
         if (stick_idle)
         {
@@ -398,6 +435,7 @@ private:
     std::vector<int32_t> prev_buttons_;
     bool has_joy_data_ = false;
     rclcpp::Time last_joy_recv_time_;
+    bool was_in_deadband_ = false;  // diagnostics only: logs deadband transitions
 
     // Defaults false so that until vehicle_status is ever received, the node only
     // emits the neutral heartbeat and never commands motion or position hold.
