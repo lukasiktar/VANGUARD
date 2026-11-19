@@ -3,12 +3,12 @@
 | Item        | Value                                  |
 |-------------|----------------------------------------|
 | Hardware    | Jetson Orin Nano, JetPack 6 (L4T R36.5.2), Ubuntu 22.04, arm64 |
-| ROS 2       | Humble (inside Docker only)            |
+| ROS 2       | Humble (inside Docker)                 |
 | Package     | `vanguard` (`ament_python`)            |
 | Base image  | `nvcr.io/nvidia/l4t-jetpack:r36.4.0`   |
 | Image       | `vanguard-ros2:humble-gpu`             |
 | Container   | `vanguard_ros2`                        |
-| Workspace   | host `~/VANGUARD` → container `/ros2_ws` |
+| Workspace   | host `~/VANGUARD` → container `src` and  `mapper` |
 
 ## 1. Host prerequisites
 
@@ -53,11 +53,20 @@ VANGUARD/
 ├── SETUP.md
 └── src/
     └── vanguard/
+└── mapper/
+    └── bags/
+    └── config/
+    └── docker/
+    └── maps/
+    └── patches/
+    └── scripts/
+    └── src/
+      └── /d455_mapping/
 ```
 
 `build/`, `install/` and `log/` are created on the host by `colcon`.
 
-## 3. Build the image
+## 3. Build the image Vanguard drone EDU
 
 ```bash
 cd ~/VANGUARD

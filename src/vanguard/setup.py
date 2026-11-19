@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'vanguard_node = vanguard.vanguard_node:main',
             'mocap_to_px4_node = vanguard.mocap_to_px4_node:main',
+            'px4_odom_bridge = vanguard.px4_odom_bridge:main',
+            'vslam_to_px4_node = vanguard.vslam_to_px4_node:main',
         ],
     },
 )
