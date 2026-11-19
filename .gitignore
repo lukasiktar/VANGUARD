@@ -11,3 +11,5 @@ __pycache__/
 *.orig
 .vscode/
 /ros2
+# vg launcher runtime (logs)
+/.vg/

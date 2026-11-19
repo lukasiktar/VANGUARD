@@ -1,0 +1,80 @@
+# VANGUARD launcher config (used by ./vg.py).
+# Override any value for one run without editing this file:
+#   ./vg.py up validation --map lab_1_261117 --set optitrack.drone_id=30 --set mapper.prior_map=false
+# Use another file: ./vg.py -c my_run.yaml ...
+
+map: lab_2_261119        # mapper/maps/<map>.db  (./vg.py maps lists them)
+platform: orin_nano      # orin_nano | laptop
+
+agent:
+  port: 8888             # MicroXRCEAgent udp4 -p <port>
+
+optitrack:
+  drone_id: 28           # Motive Streaming ID of the drone rigid body
+  pole_id: 6             # Motive Streaming ID of the construction (cross_rel_gt)
+  base_in_pivot_xyz: [0.0, 0.0, 0.0]   # PX4 body origin in the drone rigid body's axes [m]
+  cross_in_pole_xyz: [0.0, 0.0, 0.0]   # cross centre from the construction pivot [m]
+
+mapper:                  # turned into launch args of map.sh / localize.sh
+  cross_detector: true   # with_cross_detector:=true
+  px4_vio: true          # px4_vio:=true (needed by vslam_to_px4)
+  prior_map: true        # localize.sh --prior-map
+  with_pins: false       # with_pins:=true (validation mode turns it on)
+  extra_args: []         # more launch args, e.g. ["foo:=bar"]
+
+vslam_to_px4:            # ROS parameters of vslam_to_px4_node (-p name:=value)
+  stamp_offset_s: 0.019
+  gap_s: 0.2
+
+cross_rel_base:
+  pin_id: null           # set when maps/<map>_pins.json holds several pins
+
+rviz: true               # start RViz on the VNC desktop in mapping / localization modes
+
+record:                  # ./vg.py record [name]  (bags/<name>, default <mode>_<map>_<time>)
+  topics:
+    - /cross_rel/vslam
+    - /cross_rel/gt
+    - /cross_rel/vslam_distance
+    - /cross_rel/gt_distance
+    - /rtabmap/localization_pose
+    - /mocap/gt/vehicle_odometry
+    - /mocap/gt/pose
+    - /fmu/out/vehicle_odometry
+    - /fmu/in/vehicle_visual_odometry
+    - /vslam/odom_px4
+
+check:                   # ./vg.py check: topics whose rate is shown
+  topics:
+    - /rigid_bodies
+    - /mocap/gt/vehicle_odometry
+    - /fmu/out/vehicle_odometry
+    - /fmu/in/vehicle_visual_odometry
+    - /vslam/odom_px4
+    - /rtabmap/localization_pose
+    - /cross_rel/vslam
+    - /cross_rel/gt
+
+# Modes = ordered stages. `set` overrides config values for that mode only.
+# Stages: agent optitrack mocap_to_px4 mocap_gt mapper map localize vslam_to_px4
+#         cross_rel_base cross_rel_gt rviz record   (+ any under custom_stages)
+# mocap_to_px4 and vslam_to_px4 both publish /fmu/in/vehicle_visual_odometry: ./vg.py never runs both.
+modes:
+  optitrack:             # phase 1: OptiTrack feeds EKF2 (EKF2 params: param_OPTITRACK_*)
+    stages: [agent, optitrack, mocap_to_px4]
+  mapping:               # phase 2: build a new map (map.sh refuses to overwrite an existing one)
+    stages: [agent, mapper, map, vslam_to_px4, rviz]
+  localization:          # phase 2: cuVSLAM feeds EKF2 (EKF2 params: param_CUVSLAM_*)
+    stages: [agent, mapper, localize, vslam_to_px4, rviz]
+  validation:            # phase 3: cuVSLAM feeds EKF2, OptiTrack only as ground truth
+    stages: [agent, optitrack, mocap_gt, cross_rel_gt, mapper, localize, vslam_to_px4,
+             cross_rel_base, rviz]
+    set:
+      mapper.with_pins: true
+
+# Your own stages. container: ros2 (vanguard_ros2, cwd /ros2_ws) or mapper (cwd
+# /workspaces/isaac_ros-dev). {map}, {platform} and any {section.key} from this file are filled in.
+custom_stages: {}
+#  px4_bridge:
+#    container: ros2
+#    cmd: ros2 run vanguard px4_odom_bridge

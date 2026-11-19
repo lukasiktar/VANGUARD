@@ -29,6 +29,7 @@ setup(
             'px4_odom_bridge = vanguard.px4_odom_bridge:main',
             'vslam_to_px4_node = vanguard.vslam_to_px4_node:main',
             'cross_rel_gt = vanguard.cross_rel_gt:main',
+            'mocap_gt_node = vanguard.mocap_gt_node:main',
         ],
     },
 )
